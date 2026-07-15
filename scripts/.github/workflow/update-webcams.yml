@@ -1,0 +1,60 @@
+name: Update Webcams
+
+on:
+  schedule:
+    - cron: "0 */4 * * *"      # la fiecare 4 ore (UTC). Cron-ul GitHub e "best effort".
+  workflow_dispatch:            # buton de rulare manuala din tab-ul Actions
+  push:
+    paths:
+      - "scripts/build_webcams.py"
+      - ".github/workflows/update-webcams.yml"
+
+permissions:
+  contents: write               # necesar ca action-ul sa faca commit inapoi in repo
+
+concurrency:
+  group: update-webcams
+  cancel-in-progress: false     # nu taia o rulare in curs cand porneste alta
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    env:
+      # --- reglaje (schimba-le aici, fara sa atingi scriptul) ---
+      STRIKE_LIMIT: "3"         # cate esecuri consecutive pana scoatem un stream
+      BROKEN_WEIGHT: "3"        # broken clar (404/video sters/neembeddable) => scoatere instant
+      REQUIRE_LIVE: "true"      # YouTube: cere sa fie LIVE acum (webcam 24/7). pune "false" ca sa fii mai permisiv
+      DROP_HTTP_HLS: "true"     # scoate HLS pe http:// (mixed-content pe site https)
+      TIMEOUT: "8"
+      HLS_WORKERS: "32"
+      YT_WORKERS: "8"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Build & sanitize webcams
+        run: python scripts/build_webcams.py
+
+      - name: Commit if changed
+        run: |
+          git config user.name  "webcam-bot"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add webcams.json webcams_state.json
+          if git diff --staged --quiet; then
+            echo "Nimic schimbat, nu fac commit."
+          else
+            git commit -m "chore: refresh webcams ($(date -u +%Y-%m-%dT%H:%MZ)) [skip ci]"
+            git push
+          fi
