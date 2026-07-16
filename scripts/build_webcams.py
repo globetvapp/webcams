@@ -1,31 +1,28 @@
 #!/usr/bin/env python3
 """
-build_webcams.py
-----------------
+build_webcams.py  (v2 - fix validare YouTube)
+---------------------------------------------
 Trage streams.geojson din willytop8/Live-Environment-Streams, pastreaza DOAR
 ce se poate pune in embed (url_type = hls | youtube), sanitizeaza fiecare
 stream si scrie webcams.json gata de folosit pe site.
 
-Sanitizarea NU e o singura verificare: foloseste un sistem de "strikes"
-(webcams_state.json). Un stream e scos de pe site DOAR dupa STRIKE_LIMIT
-verificari nereusite la rand -> un hiccup temporar de retea sau un bot-check
-YouTube nu-ti sterge baza de date, dar streamurile chiar moarte dispar in
-cateva rulari.
+FIX v2: pe runnerele GitHub (IP-uri de datacenter) YouTube servea pagina de
+bot-check ("Sign in to confirm you're not a bot" -> status LOGIN_REQUIRED /
+UNPLAYABLE), iar v1 o interpreta gresit ca "video mort" si scotea toate
+streamurile YouTube. Acum:
+  * validarea YouTube foloseste endpoint-ul oEmbed (mult mai rar bot-walled);
+  * bot-wall-urile (LOGIN_REQUIRED / UNPLAYABLE / 429 / lipsa) NU mai scot
+    niciodata un stream -> raman ca "unknown"/"ok";
+  * un YouTube e scos DOAR daca oEmbed spune clar sters (404) sau privat (401),
+    ori daca o pagina watch curata (fara bot-wall) zice playableInEmbed:false.
 
-Rezultat (verdicte per stream):
-  ok      -> merge, fails=0
-  broken  -> dovada clara ca e mort (404/410, video sters/privat, neembeddable)
-  unknown -> nu s-a putut determina (timeout, 403/429, bot-wall) -> nu penalizam dur
-
-Config prin variabile de mediu (vezi workflow-ul):
-  SOURCE_URL, STRIKE_LIMIT, BROKEN_WEIGHT, REQUIRE_LIVE, TIMEOUT,
-  HLS_WORKERS, YT_WORKERS, DROP_HTTP_HLS
-Ruleaza cu --offline ca sa sari peste probare (doar filtrare + extragere).
+Sanitizare pe "strikes" (webcams_state.json): un stream e scos doar dupa
+STRIKE_LIMIT esecuri consecutive. "ok" reseteaza contorul -> streamurile scoase
+din greseala in v1 revin automat la prima rulare buna.
 """
 
 import os
 import re
-import sys
 import json
 import time
 import random
@@ -35,20 +32,19 @@ import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # ---------------------------------------------------------------- config
-SOURCE_URL   = os.environ.get(
+SOURCE_URL = os.environ.get(
     "SOURCE_URL",
     "https://raw.githubusercontent.com/willytop8/Live-Environment-Streams/main/streams.geojson",
 )
-OUTPUT       = os.environ.get("OUTPUT", "webcams.json")
-STATE_FILE   = os.environ.get("STATE_FILE", "webcams_state.json")
+OUTPUT     = os.environ.get("OUTPUT", "webcams.json")
+STATE_FILE = os.environ.get("STATE_FILE", "webcams_state.json")
 
-STRIKE_LIMIT   = int(os.environ.get("STRIKE_LIMIT", "3"))    # cate esecuri la rand pana scoatem
-BROKEN_WEIGHT  = int(os.environ.get("BROKEN_WEIGHT", "3"))   # cat "cantareste" un broken clar (=limit -> scoatere instant)
-REQUIRE_LIVE   = os.environ.get("REQUIRE_LIVE", "true").lower() == "true"
-DROP_HTTP_HLS  = os.environ.get("DROP_HTTP_HLS", "true").lower() == "true"
-TIMEOUT        = float(os.environ.get("TIMEOUT", "8"))
-HLS_WORKERS    = int(os.environ.get("HLS_WORKERS", "32"))
-YT_WORKERS     = int(os.environ.get("YT_WORKERS", "8"))      # blandut cu YouTube ca sa nu declansam bot-check
+STRIKE_LIMIT  = int(os.environ.get("STRIKE_LIMIT", "3"))
+BROKEN_WEIGHT = int(os.environ.get("BROKEN_WEIGHT", "3"))
+DROP_HTTP_HLS = os.environ.get("DROP_HTTP_HLS", "true").lower() == "true"
+TIMEOUT       = float(os.environ.get("TIMEOUT", "8"))
+HLS_WORKERS   = int(os.environ.get("HLS_WORKERS", "32"))
+YT_WORKERS    = int(os.environ.get("YT_WORKERS", "6"))   # blandut cu YouTube
 
 EMBEDDABLE_TYPES = {"hls", "youtube"}
 
@@ -58,8 +54,8 @@ YT_HEADERS  = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
 YT_COOKIES  = {"CONSENT": "YES+1", "SOCS": "CAI"}
 HLS_HEADERS = {"User-Agent": UA}
 
-VIDEO_ID_RE = re.compile(r'(?:v=|/embed/|youtu\.be/|/live/)([\w-]{11})')
-ANY_VID_RE  = re.compile(r'"videoId":"([\w-]{11})"')
+VIDEO_ID_RE   = re.compile(r'(?:v=|/embed/|youtu\.be/|/live/)([\w-]{11})')
+ANY_VID_RE    = re.compile(r'"videoId":"([\w-]{11})"')
 PLAYSTATUS_RE = re.compile(r'"playabilityStatus":\{"status":"([A-Z_]+)"')
 
 now_iso = lambda: dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
@@ -87,7 +83,6 @@ def fetch_source():
 
 # ---------------------------------------------------------------- filter + normalize
 def build_candidates(geojson):
-    """Filtreaza la embeddable, extrage videoId, construieste recordurile."""
     out, seen, stats = [], set(), {"http_hls_dropped": 0, "yt_unresolved": 0}
     for feat in geojson.get("features", []):
         p = feat.get("properties", {})
@@ -117,13 +112,12 @@ def build_candidates(geojson):
             "environment": p.get("environment"),
             "scene": p.get("scene_type"),
             "type": t,
-            "_url": url,          # camp intern, scos la final
+            "_url": url,
         }
         if t == "youtube":
             m = VIDEO_ID_RE.search(url)
             rec["video_id"] = m.group(1) if m else None
             if not rec["video_id"]:
-                # e o adresa /live sau /channel -> se rezolva la probare
                 rec["_needs_resolve"] = True
                 stats["yt_unresolved"] += 1
         out.append(rec)
@@ -132,7 +126,6 @@ def build_candidates(geojson):
 
 # ---------------------------------------------------------------- validators
 def resolve_channel_live(url, session):
-    """Pentru URL-uri /live sau /channel: scoate videoId-ul curent din HTML."""
     try:
         r = session.get(url, timeout=TIMEOUT, headers=YT_HEADERS, cookies=YT_COOKIES)
         if r.status_code == 200:
@@ -144,35 +137,44 @@ def resolve_channel_live(url, session):
 
 
 def check_youtube(video_id, session):
-    """(verdict, meta). verdict in {ok, broken, unknown}."""
+    """
+    oEmbed = sursa principala (rezistenta la bot-check). Bot-wall-urile de pe
+    pagina watch NU scot niciodata streamul.
+    """
+    oembed = ("https://www.youtube.com/oembed?url="
+              f"https://www.youtube.com/watch?v={video_id}&format=json")
     try:
-        r = session.get(f"https://www.youtube.com/watch?v={video_id}",
-                        timeout=TIMEOUT, headers=YT_HEADERS, cookies=YT_COOKIES)
+        oe = session.get(oembed, timeout=TIMEOUT, headers=YT_HEADERS)
     except Exception:
-        return "unknown", {"reason": "request_error"}
-    if r.status_code != 200:
-        return "unknown", {"reason": f"http_{r.status_code}"}
+        return "unknown", {"reason": "oembed_error"}
 
-    h = r.text
-    # bot-check / consent wall -> nu putem sti, nu penalizam
-    if "playabilityStatus" not in h or "consent.youtube.com" in h or "/recaptcha/" in h:
-        return "unknown", {"reason": "bot_wall"}
+    if oe.status_code in (401, 403):
+        return "broken", {"reason": "private_or_embed_off"}
+    if oe.status_code == 404:
+        return "broken", {"reason": "deleted"}
+    if oe.status_code != 200:
+        return "unknown", {"reason": f"oembed_{oe.status_code}"}
 
-    m = PLAYSTATUS_RE.search(h)
-    status = m.group(1) if m else None
-    embeddable = '"playableInEmbed":true' in h
-    is_live = '"isLive":true' in h or '"isLiveNow":true' in h
-
-    if status in ("ERROR", "LOGIN_REQUIRED", "UNPLAYABLE"):
-        return "broken", {"reason": f"status_{status}"}
-    if not embeddable:
-        return "broken", {"reason": "not_embeddable"}
-    if status == "LIVE_STREAM_OFFLINE":
-        # e videoul corect dar offline acum -> tranzitoriu, lasam strikes sa decida
-        return "unknown", {"reason": "offline_now", "is_live": False}
-    if REQUIRE_LIVE and not is_live:
-        return "unknown", {"reason": "not_live_now", "is_live": False}
-    return "ok", {"is_live": is_live}
+    # exista si e public. rafinam DOAR pe o pagina watch curata (fara bot-wall).
+    meta = {}
+    try:
+        w = session.get(f"https://www.youtube.com/watch?v={video_id}",
+                        timeout=TIMEOUT, headers=YT_HEADERS, cookies=YT_COOKIES)
+        h = w.text
+        clean = ("playabilityStatus" in h
+                 and "consent.youtube.com" not in h
+                 and "/recaptcha/" not in h)
+        if clean:
+            m = PLAYSTATUS_RE.search(h)
+            status = m.group(1) if m else None
+            if status == "OK":
+                if '"playableInEmbed":false' in h:
+                    return "broken", {"reason": "embed_disabled"}
+                meta["is_live"] = ('"isLive":true' in h or '"isLiveNow":true' in h)
+            # LOGIN_REQUIRED / UNPLAYABLE / lipsa -> bot-wall -> ignoram, pastram oEmbed OK
+    except Exception:
+        pass
+    return "ok", meta
 
 
 def check_hls(url, session):
@@ -190,12 +192,9 @@ def check_hls(url, session):
     if code in (404, 410):
         return "broken", {"reason": f"http_{code}"}
     if code == 200:
-        head = r.text[:4096]
-        if "#EXTM3U" in head:
+        if "#EXTM3U" in r.text[:4096]:
             return "ok", {}
         return "unknown", {"reason": "not_a_playlist"}
-    if code in (401, 403, 429) or 500 <= code < 600:
-        return "unknown", {"reason": f"http_{code}"}      # posibil tranzitoriu
     return "unknown", {"reason": f"http_{code}"}
 
 
@@ -208,26 +207,24 @@ def probe(rec):
             vid = resolve_channel_live(rec["_url"], session)
             rec["video_id"] = vid
         if not vid:
-            return rec, "broken", {"reason": "no_video_id"}
+            return rec, "unknown", {"reason": "no_video_id"}   # nu scoatem pe un fail tranzitoriu
         verdict, meta = check_youtube(vid, session)
-        time.sleep(random.uniform(0.15, 0.5))   # jitter -> mai putine bot-check
+        time.sleep(random.uniform(0.2, 0.6))                   # jitter -> mai putine bot-check
         return rec, verdict, meta
-    else:
-        return (rec, *check_hls(rec["_url"], session))
+    return (rec, *check_hls(rec["_url"], session))
 
 
 # ---------------------------------------------------------------- main
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--offline", action="store_true",
-                    help="doar filtrare+extragere, fara probare live")
-    ap.add_argument("--source", help="cale locala catre streams.geojson (test)")
+    ap.add_argument("--offline", action="store_true")
+    ap.add_argument("--source")
     args = ap.parse_args()
 
     if args.source:
         geojson = load_json(args.source, {"features": []})
     else:
-        print(f"-> descarc sursa: {SOURCE_URL}")
+        print(f"-> descarc: {SOURCE_URL}")
         geojson = fetch_source()
 
     candidates, fstats = build_candidates(geojson)
@@ -239,23 +236,20 @@ def main():
     ok = broken = unknown = 0
 
     if args.offline:
-        # toate trec ca "ok" ca sa putem verifica pipeline-ul fara retea
         for rec in candidates:
             st = state.get(rec["id"], {"fails": 0, "last_ok": None})
-            st.update(fails=0, last_ok=now_iso(), last_check=now_iso(),
-                      type=rec["type"])
+            st.update(fails=0, last_ok=now_iso(), last_check=now_iso(), type=rec["type"])
             state[rec["id"]] = st
             ok += 1
     else:
         hls = [c for c in candidates if c["type"] == "hls"]
         yt  = [c for c in candidates if c["type"] == "youtube"]
-
         results = []
         print(f"-> probez {len(hls)} HLS (workers={HLS_WORKERS}) ...")
         with ThreadPoolExecutor(max_workers=HLS_WORKERS) as ex:
             for fut in as_completed(ex.submit(probe, c) for c in hls):
                 results.append(fut.result())
-        print(f"-> probez {len(yt)} YouTube (workers={YT_WORKERS}, jitter) ...")
+        print(f"-> probez {len(yt)} YouTube via oEmbed (workers={YT_WORKERS}) ...")
         with ThreadPoolExecutor(max_workers=YT_WORKERS) as ex:
             for fut in as_completed(ex.submit(probe, c) for c in yt):
                 results.append(fut.result())
@@ -280,12 +274,10 @@ def main():
                 rec["is_live"] = meta["is_live"]
             state[rec["id"]] = st
 
-    # curata din state ce nu mai exista in sursa (evita cresterea la infinit)
     live_ids = {c["id"] for c in candidates}
     for dead in [k for k in state if k not in live_ids]:
         del state[dead]
 
-    # construieste lista curata: doar sub pragul de strikes
     by_id = {c["id"]: c for c in candidates}
     clean = []
     for cid, st in state.items():
@@ -294,11 +286,13 @@ def main():
         rec = by_id.get(cid)
         if not rec:
             continue
+        if rec["type"] == "youtube" and not rec.get("video_id"):
+            continue  # fara video_id nu avem ce embeda
         out = {k: v for k, v in rec.items() if not k.startswith("_")}
-        if rec["type"] == "youtube" and rec.get("video_id"):
+        if rec["type"] == "youtube":
             out["embed"] = (f"https://www.youtube.com/embed/"
                             f"{rec['video_id']}?autoplay=1&mute=1&playsinline=1")
-        elif rec["type"] == "hls":
+        else:
             out["src"] = rec["_url"]
         out["verified"] = st.get("fails", 0) == 0
         out["last_ok"] = st.get("last_ok")
@@ -324,11 +318,10 @@ def main():
     summary = (
         f"Webcams live: {len(clean)} "
         f"(YouTube {payload['by_type']['youtube']}, HLS {payload['by_type']['hls']})\n"
-        f"Verdicte aceasta rulare: ok={ok}, broken={broken}, unknown={unknown}\n"
-        f"Prag strikes={STRIKE_LIMIT}, intrari in state={len(state)}"
+        f"Verdicte: ok={ok}, broken={broken}, unknown={unknown} | "
+        f"prag strikes={STRIKE_LIMIT}, state={len(state)}"
     )
     print("\n" + summary)
-
     gh = os.environ.get("GITHUB_STEP_SUMMARY")
     if gh:
         with open(gh, "a", encoding="utf-8") as fh:
