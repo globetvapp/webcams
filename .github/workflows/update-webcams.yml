@@ -24,12 +24,11 @@ jobs:
     env:
       # --- reglaje (schimba-le aici, fara sa atingi scriptul) ---
       STRIKE_LIMIT: "3"         # cate esecuri consecutive pana scoatem un stream
-      BROKEN_WEIGHT: "3"        # broken clar (404/video sters/neembeddable) => scoatere instant
-      REQUIRE_LIVE: "true"      # YouTube: cere sa fie LIVE acum (webcam 24/7). pune "false" ca sa fii mai permisiv
+      BROKEN_WEIGHT: "3"        # broken clar (video sters/privat) => scoatere instant
       DROP_HTTP_HLS: "true"     # scoate HLS pe http:// (mixed-content pe site https)
       TIMEOUT: "8"
       HLS_WORKERS: "32"
-      YT_WORKERS: "8"
+      YT_WORKERS: "6"           # blandut cu YouTube (validare via oEmbed)
 
     steps:
       - name: Checkout
